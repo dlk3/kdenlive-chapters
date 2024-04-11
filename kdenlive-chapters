@@ -1,0 +1,93 @@
+#!/usr/bin/env python
+
+from lxml import etree
+import json
+import os
+import subprocess
+import tempfile
+from optparse import OptionParser
+
+#  Configure logging
+import logging
+logging.basicConfig(format='%(asctime)s: %(levelname)s: %(message)s', datefmt='%d-%b-%y %H:%M:%S', level=logging.INFO)
+
+if __name__ == '__main__':
+	usage = '\033[00;01m%prog\033[00m [-d|--debug] -i|--input inputvideofilename -o|--output outputvideofilename --g|--guides kdenlivefilename'
+	description = 'Add guide marks saved in a Kdenlive project file to a video file as chapter marks'
+	parser = OptionParser(usage=usage, description=description)
+	parser.add_option('-d', '--debug', action='store_true', dest='debug', default=False, help='Output additional debugging information during processing')
+	parser.add_option('-i', '--input', action='store', dest='input_file', help='The video file that chapters are to be added to')
+	parser.add_option('-o', '--output', action='store', dest='output_file', help='The output MKV video file that will be created')
+	parser.add_option('-g', '--guides', action='store', dest='guide_file', help='A Kdenlive project file that contains the guide marks')
+	(opts, args) = parser.parse_args()
+	if opts.debug:
+		logger = logging.getLogger()
+		logger.setLevel(logging.DEBUG)
+	if not opts.input_file:
+		parser.error('A video input file must be specified (-i|--input_file)')
+	if not opts.output_file:
+		parser.error('A video output file must be specified (-o|--output_file)')
+	if not opts.guide_file:
+		parser.error('A Kdenlive project file must be specified (-g|--guide_file)')
+		
+	#  Get the framerate, length in frames, and guide marks data from the guide_file
+	try:
+		tree = etree.parse(opts.guide_file)
+		#  Get the framerate that's defined in the profile
+		fps = round(float(tree.xpath('//mlt/profile/@frame_rate_num')[0]) / float(tree.xpath('//mlt/profile/@frame_rate_den')[0]), 2)
+		logging.debug('frame rate as defined in Kdenlive profile: {}'.format(fps))
+		#  Get the total number of frames in the video
+		total_frames = int(tree.xpath('//mlt/chain[@id="chain0"]/property[@name="length"]')[0].text.strip())
+		logging.debug('Total number of frames: {}'.format(total_frames))
+		#  Get the text string of guide marks
+		guide_data = tree.xpath('//property[@name="kdenlive:sequenceproperties.guides"]')[0].text.strip()
+		logging.debug('Guide data read from file {}:\n{}'.format(opts.guide_file, guide_data))
+		#  Convert the text string into a JSON dictionary
+		guide_data = json.loads(guide_data)
+		logging.debug('Guide data in JSON format:\n{}'.format(guide_data))
+		#  Sort the JSON dictionary based on the chapter "pos" key value
+		guide_data = sorted(guide_data, key=lambda k: k['pos'])
+	except:
+		logging.exception('Unexpected exception:', exc_info=True)
+		exit(1)
+
+	try:
+		#  Where we will write a temporary ffmetadata file
+		ffmetadata_file = tempfile.gettempdir() + '/ffmetadata.txt'
+
+		#  Write the current metadata, minus any chapters, into the
+		#  temporary ffmetadata file
+		logging.debug('Getting existing metadata from {}'.format(opts.input_file))
+		subprocess.run('ffmpeg -y -hide_banner -i "{}" -map_chapters -1 -f ffmetadata "{}"'.format(opts.input_file, ffmetadata_file), shell=True, capture_output=not opts.debug)
+
+		#  Chapter start and end times are expressed as a number of fractions
+		#  of a second in the ffmetadata file.  This is the fraction typically
+		#  used, but it can be any integer, usually a power of 10.
+		timebase = 1000000000
+		
+		#  Append the chapter metadata to the ffmetadata file
+		logging.debug('Appending chapter metadata to {}'.format(ffmetadata_file))
+		with open(ffmetadata_file, 'a') as f:
+			for chapter in guide_data:
+				#  Get the starting frame number of the next chapter in the list
+				next_index = guide_data.index(chapter) + 1
+				if next_index < len(guide_data):
+					next_pos = guide_data[guide_data.index(chapter) + 1]['pos']
+				else:
+					#  The last chapter ends at the end of the video
+					next_pos = total_frames
+				f.write('[CHAPTER]\n')
+				f.write('TIMEBASE=1/{}\n'.format(timebase))
+				f.write('START={}\n'.format(chapter['pos'] / fps * timebase))
+				f.write('END={}\n'.format((next_pos - 1) / fps * timebase))
+				f.write('title={}\n'.format(chapter['comment']))
+
+		#  Remux the input file into a MKV file along with the contents of the ffmetadata file
+		logging.debug('Remuxing video with chapter metadata as {}'.format(opts.output_file))
+		subprocess.run('ffmpeg -y -hide_banner -i "{}" -i "{}" -map_metadata 1 -c copy "{}"'.format(opts.input_file, ffmetadata_file, opts.output_file), shell=True, capture_output=not opts.debug)
+	except:
+		logging.exception('Unexpected exception:', exc_info=True)
+		exit(1)
+		
+	logging.info('Output file created: {}'.format(opts.output_file))
+	logging.info('ffmetadata file created: {}'.format(ffmetadata_file))
